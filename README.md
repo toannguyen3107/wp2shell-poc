@@ -6,10 +6,9 @@ SQL injection associated with Searchlight Cyber's wp2shell advisory.
 The unauthenticated primitive reaches the injection through a single endpoint:
 `POST /wp-json/batch/v1`.
 
-This repository is not Searchlight Cyber's official checker and does not claim to reproduce
-undisclosed wp2shell internals. `check` confirms the SQLi path, `read` demonstrates database
-read, and `shell` is an optional post-authentication helper that requires valid administrator
-credentials before uploading a plugin webshell.
+This repository is not Searchlight Cyber's official checker. `check` confirms the SQLi path,
+`read` demonstrates database read, and `shell` opens a plugin-backed command shell either with
+supplied administrator credentials or by first exercising the SQLi-to-admin bridge.
 
 ## Affected versions
 
@@ -44,13 +43,20 @@ The PoC nests the primitive twice:
    `author__not_in` query var, which the vulnerable build interpolates into SQL as a string.
 
 The result is a boolean- and time-based blind SQL injection reachable pre-authentication. This PoC
-can use that database read path to recover administrator password hashes. Turning those hashes into
-plugin-upload code execution is outside the unauthenticated primitive and depends on obtaining valid
-administrator credentials.
+also includes the stronger UNION fake-post primitive used by the SQLi-to-admin chain.
 
-Searchlight has not published the final jump from SQLi to pre-auth RCE. That may involve a
-database file-write trick such as MySQL `OUTFILE`, or it may be something else in core. This repo
-does not include that step.
+The RCE path implemented here is:
+
+1. Use UNION fake `wp_posts` rows to render attacker-controlled content through a posts collection.
+2. Use that render to make WordPress create real oEmbed cache posts.
+3. Recover those real cache post IDs through the SQLi.
+4. In one poisoned batch request, recast those IDs as a customizer changeset, navigation item, and
+   request hook shape.
+5. Let the same request reach `POST /wp/v2/users`, creating a generated administrator.
+6. Log in as that generated administrator and use normal plugin upload behavior to run a command.
+
+The last command-execution step is ordinary authenticated administrator plugin upload. The
+pre-authentication part is the admin creation bridge.
 
 ## Requirements
 
@@ -101,20 +107,44 @@ check does not override a positive marker probe.
 ./wp2shell.py read http://target --query "SELECT @@version"
 ```
 
-### shell — post-auth plugin webshell helper
+By default extraction is `--technique auto`, which picks the fastest in-band method that works:
 
-Optional post-exploitation helper. This is not a pre-authentication RCE step: it requires valid
-administrator credentials. If `read --preset users` recovers a password hash, supply the recovered
-plaintext here after offline cracking.
+1. **union** — forges a fake `WP_Post` row and reads its reflected title: **one request per value**.
+   The source request targets the single-post item route (`/wp/v2/posts/999999`), so the
+   collection-only params `author_exclude`, `orderby` and `per_page` ride through unchecked; the
+   inner desync dispatches it under the posts *collection* handler, where `orderby=none` removes the
+   trailing `ORDER BY` (which otherwise breaks `UNION`) and `per_page=500` keeps `WP_Query` in
+   full-row mode (so the union row survives instead of being re-primed from the DB). A whole value
+   comes back in the REST response as `||HEX(value)||`.
+2. **error** — `EXTRACTVALUE`/`UPDATEXML` leak ~15 bytes per request, when the target reflects
+   MySQL errors (e.g. `WP_DEBUG_DISPLAY` on).
+3. **blind** — boolean/timing binary search, ~8 requests per character; works with no reflection.
+
+Force one with `--technique union|error|blind`. All three are strictly **read only**. The union
+path also demonstrates fake-`WP_Post` object-cache poisoning: the forged row is added to the `posts`
+cache for the rest of the request, and its `post_content` blocks render through REST (which enables
+unauthenticated SSRF via RSS/oEmbed blocks). A full password hash is ~2 requests with `union`, ~7
+with `error`, versus ~490 blind.
+
+### shell — command execution
+
+With `--user` and `--password`, `shell` logs in with supplied administrator credentials and uses
+normal WordPress plugin upload behavior. This mode would work the same way on a patched site where
+those credentials are valid.
+
+Without credentials, `shell` first runs the pre-auth SQLi-to-admin bridge, logs in as the generated
+administrator, then uploads the plugin shell.
 
 ```
 ./wp2shell.py shell http://target --user admin --password '<recovered>' --cmd id
 ./wp2shell.py shell http://target --user admin --password '<recovered>' -i   # interactive shell
+./wp2shell.py shell http://target --rest-route --cmd id                      # pre-auth bridge
+./wp2shell.py shell http://target --rest-route -i                            # pre-auth interactive
 ```
 
 `shell` uploads a plugin webshell (locked behind a random path and a per-run token) and prints its
-path. Remove it when finished — either pass `--cleanup` to have it delete itself after running, or
-delete the plugin manually.
+path. The uploaded webshell is removed automatically. When the pre-auth bridge creates an
+administrator, that generated account is removed automatically after the shell session finishes.
 
 ## Options
 
@@ -127,13 +157,13 @@ delete the plugin manually.
 | `--samples N`       | check      | Timing pairs used with `--confirm-sqli` (default 3).                 |
 | `--confirm-sqli`    | check      | Also send the active SQL timing confirmation payload.                |
 | `--preset`          | read       | `fingerprint` or `users`.                                            |
+| `--technique`       | read       | `auto` (default), `union` (in-band, forges a fake post), `error` (in-band, needs visible DB errors), or `blind`. |
 | `--query`           | read       | A scalar SQL expression to read.                                     |
 | `--prefix`          | read       | Database table prefix (default `wp_`).                               |
 | `--max-length N`    | read       | Maximum characters read per value (default 128).                     |
-| `--user` / `--password` | shell  | Admin credentials (plaintext, recovered from the hash).             |
+| `--user` / `--password` | shell  | Optional admin credentials; omit both to use the pre-auth bridge.   |
 | `--cmd`             | shell      | Command to run (omit when using `-i`).                              |
 | `-i` / `--interactive` | shell   | Open an interactive shell after deploying.                           |
-| `--cleanup`         | shell      | Delete the webshell from the target when finished.                   |
 
 ## Remediation
 

