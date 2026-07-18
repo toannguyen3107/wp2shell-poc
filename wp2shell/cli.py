@@ -154,8 +154,10 @@ def cmd_check(args: argparse.Namespace) -> int:
             f"SQL timing not confirmed — baseline {result.baseline:.2f}s, injected "
             f"{result.delayed:.2f}s; route-confusion marker pattern still detected."
         )
+        warn("A WAF or edge rule may be filtering the SQLi payload; the route-confusion bug still looks present.")
         return 0
     bad(f"Not timing-confirmed — baseline {result.baseline:.2f}s, injected {result.delayed:.2f}s.")
+    warn("This may be a patched target, or a WAF/edge rule filtering the SQLi payload.")
     if any(hint.affected for hint in hints):
         warn("Version suggests exposure, but the timing payload did not execute or was blocked.")
     return 2
