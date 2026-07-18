@@ -203,7 +203,12 @@ def cmd_read(args: argparse.Namespace) -> int:
 _CWD_MARK = "__wp2shellcwd__"  # shell-metacharacter-free so it survives the remote shell
 
 
-def _repl(session: AdminSession, path: str) -> None:
+def _repl(
+    session: AdminSession,
+    path: str,
+    *,
+    propagate_interrupt: bool = False,
+) -> None:
     """A minimal interactive prompt piping each line through the webshell.
 
     Commands are stateless server-side, so the working directory is tracked client-side and
@@ -218,8 +223,13 @@ def _repl(session: AdminSession, path: str) -> None:
     while True:
         try:
             line = input(_paint("36", f"{cwd} $ "))
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print()
+            return
+        except KeyboardInterrupt:
+            print()
+            if propagate_interrupt:
+                raise
             return
         command = line.strip()
         if not command:
@@ -272,7 +282,11 @@ def cmd_shell(args: argparse.Namespace) -> int:
                 print()
 
         if args.interactive:
-            _repl(session, path)
+            _repl(
+                session,
+                path,
+                propagate_interrupt=args.target_file is not None,
+            )
     finally:
         if args.cleanup:
             info("Cleaning up webshell...")

@@ -95,6 +95,18 @@ class TargetSourceTests(unittest.TestCase):
             with self.assertRaises(UnicodeDecodeError):
                 cli._load_targets(str(path))
 
+    def test_main_reports_a_missing_target_file_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing.txt"
+            output = io.StringIO()
+
+            with contextlib.redirect_stdout(output):
+                result = cli.main(["check", "-l", str(path)])
+
+        self.assertEqual(result, 1)
+        self.assertIn("No such file or directory", output.getvalue())
+        self.assertIn("missing.txt", output.getvalue())
+
     def test_list_option_is_visible_in_help(self):
         parser = cli.build_parser()
         subparsers = parser._subparsers._group_actions[0].choices
@@ -179,6 +191,48 @@ class TargetDispatchTests(unittest.TestCase):
             return_value=["http://one"],
         ), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
             cli._dispatch(args)
+
+    def test_interactive_shell_interrupt_aborts_the_whole_target_list(self):
+        class FakeSession:
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                type(self).instances.append(self)
+
+            def login(self, username, password):
+                return True
+
+            def deploy_webshell(self):
+                return "/wp-content/plugins/wp2shell_test/wp2shell_test.php"
+
+            def run(self, path, command):
+                return "/tmp\n"
+
+        with tempfile.TemporaryDirectory() as directory:
+            target_file = Path(directory) / "targets.txt"
+            target_file.write_text("http://one\nhttp://two\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(cli, "AdminSession", FakeSession),
+                mock.patch("builtins.input", side_effect=KeyboardInterrupt),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = cli.main(
+                    [
+                        "shell",
+                        "-l",
+                        str(target_file),
+                        "--user",
+                        "admin",
+                        "--password",
+                        "password",
+                        "--interactive",
+                        "--keep",
+                    ]
+                )
+
+        self.assertEqual(result, 130)
+        self.assertEqual(len(FakeSession.instances), 1)
 
 
 class ShellCommandTests(unittest.TestCase):
