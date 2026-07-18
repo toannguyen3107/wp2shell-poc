@@ -95,6 +95,16 @@ class TargetSourceTests(unittest.TestCase):
             with self.assertRaises(UnicodeDecodeError):
                 cli._load_targets(str(path))
 
+    def test_list_option_is_visible_in_help(self):
+        parser = cli.build_parser()
+        subparsers = parser._subparsers._group_actions[0].choices
+
+        for command in ("check", "read", "shell"):
+            with self.subTest(command=command):
+                help_text = subparsers[command].format_help()
+                self.assertIn("-l FILE", help_text)
+                self.assertIn("--list FILE", help_text)
+
 
 class TargetDispatchTests(unittest.TestCase):
     def test_single_target_calls_handler_without_target_header(self):

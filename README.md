@@ -62,6 +62,7 @@ Run it from the repository directory:
 
 ```
 ./wp2shell.py <command> <url> [options]
+./wp2shell.py <command> -l targets.txt [options]
 ```
 
 Or `pip install .` to get a `wp2shell` command on your `PATH`.
@@ -116,10 +117,24 @@ plaintext here after offline cracking.
 path. Remove it when finished — either pass `--cleanup` to have it delete itself after running, or
 delete the plugin manually.
 
+### Multiple targets
+
+All commands accept `-l FILE` / `--list FILE` instead of a positional URL. The
+file must be UTF-8 with one target URL per line; blank lines are ignored.
+Targets run in file order, and a failure on one target does not stop the rest.
+The same command options apply to every target.
+
+```
+./wp2shell.py check -l targets.txt
+./wp2shell.py read -l targets.txt --preset users
+./wp2shell.py shell -l targets.txt --user admin --password '<recovered>' --cmd id --cleanup
+```
+
 ## Options
 
 | Option              | Applies to | Description                                                           |
 | ------------------- | ---------- | -------------------------------------------------------------------- |
+| `-l FILE` / `--list FILE` | all | Read target URLs from a UTF-8 file, one per non-empty line.          |
 | `--rest-route`      | check, read | Use `/?rest_route=/batch/v1` (for sites without pretty permalinks). |
 | `--proxy URL`       | all        | Route traffic through an HTTP proxy (for example, Burp).             |
 | `--timeout N`       | all        | Request timeout in seconds.                                          |
