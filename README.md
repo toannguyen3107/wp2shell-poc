@@ -1,24 +1,25 @@
 # wp2shell-poc
 
-Proof-of-concept for an unauthenticated SQL injection in WordPress core that chains to remote
-code execution, via REST batch route confusion (CVE-2026-63030).
+Independent proof-of-concept for the unauthenticated WordPress REST batch route-confusion
+SQL injection associated with Searchlight Cyber's wp2shell advisory.
 
-The exploit needs no credentials and no configuration beyond a reachable target. It reaches the
-injection through a single endpoint: `POST /wp-json/batch/v1`.
+The unauthenticated primitive reaches the injection through a single endpoint:
+`POST /wp-json/batch/v1`.
 
-The finding itself is that unauthenticated SQL injection — `check` confirms it and `read`
-demonstrates arbitrary database read. The `shell` command is optional post-exploitation
-(recovered admin credentials → plugin upload → command execution), included to demonstrate full
-impact; it is not the vulnerability.
+This repository is not Searchlight Cyber's official checker and does not claim to reproduce
+undisclosed wp2shell internals. `check` confirms the SQLi path, `read` demonstrates database
+read, and `shell` is an optional post-authentication helper that requires valid administrator
+credentials before uploading a plugin webshell.
 
 ## Affected versions
 
-| Branch | Affected      | Fixed in |
-| ------ | ------------- | -------- |
-| 6.9.x  | 6.9.0 – 6.9.4 | 6.9.5    |
-| 7.0.x  | 7.0.0 – 7.0.1 | 7.0.2    |
+Searchlight Cyber's advisory lists these wp2shell RCE exposure ranges:
 
-Versions before 6.9.0 are not affected by this chain.
+| Version range | Status |
+| ------------- | ------ |
+| <= 6.8.5 | Not affected |
+| 6.9.0 – 6.9.4 | Affected |
+| 7.0.0 – 7.0.1 | Affected |
 
 ## How it works
 
@@ -42,9 +43,10 @@ The PoC nests the primitive twice:
    dispatched under posts `get_items()`. There `author_exclude` maps to the `WP_Query`
    `author__not_in` query var, which the vulnerable build interpolates into SQL as a string.
 
-The result is a boolean- and time-based blind SQL injection reachable pre-authentication. With
-database read access the administrator password hash can be recovered; once cracked, admin access
-yields code execution through a plugin upload.
+The result is a boolean- and time-based blind SQL injection reachable pre-authentication. This PoC
+can use that database read path to recover administrator password hashes. Turning those hashes into
+plugin-upload code execution is outside the unauthenticated primitive and depends on obtaining valid
+administrator credentials.
 
 ## Requirements
 
@@ -80,10 +82,11 @@ generator, the homepage generator meta tag, and core asset `?ver=` query strings
 ./wp2shell.py read http://target --query "SELECT @@version"
 ```
 
-### shell — execute a command (remote code execution)
+### shell — post-auth plugin webshell helper
 
-Optional post-exploitation. Requires valid administrator credentials; the injection recovers the
-password *hash*, so supply the recovered plaintext here.
+Optional post-exploitation helper. This is not a pre-authentication RCE step: it requires valid
+administrator credentials. If `read --preset users` recovers a password hash, supply the recovered
+plaintext here after offline cracking.
 
 ```
 ./wp2shell.py shell http://target --user admin --password '<recovered>' --cmd id
@@ -112,9 +115,10 @@ path. Remove it when finished.
 
 ## Remediation
 
-Update to WordPress 6.9.5 or 7.0.2. Until then, block both `/wp-json/batch/v1` and the
-`rest_route=/batch/v1` query parameter at the edge, or require authentication for the batch
-endpoint via the `rest_pre_dispatch` filter.
+Update to WordPress 7.0.2, or 6.9.5 if the site is on the 6.9 branch. Until then,
+block both `/wp-json/batch/v1` and the `rest_route=/batch/v1` query parameter at
+the edge, or require authentication for the batch endpoint via the
+`rest_pre_dispatch` filter.
 
 ## Legal
 
@@ -124,4 +128,4 @@ written permission to test. No warranty is provided and no liability is accepted
 ## References
 
 - WordPress 7.0.2 release announcement — <https://wordpress.org/news/2026/07/wordpress-7-0-2-release/>
-- CVE-2026-63030
+- Searchlight Cyber wp2shell advisory — <https://slcyber.io/research-center/wp2shell-pre-authentication-rce-in-wordpress-core/>
