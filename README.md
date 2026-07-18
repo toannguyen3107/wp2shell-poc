@@ -48,6 +48,10 @@ can use that database read path to recover administrator password hashes. Turnin
 plugin-upload code execution is outside the unauthenticated primitive and depends on obtaining valid
 administrator credentials.
 
+Searchlight has not published the final jump from SQLi to pre-auth RCE. That may involve a
+database file-write trick such as MySQL `OUTFILE`, or it may be something else in core. This repo
+does not include that step.
+
 ## Requirements
 
 Python 3.8+ and the standard library. No third-party dependencies.
