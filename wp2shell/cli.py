@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import shlex
 import sys
+from pathlib import Path
 from typing import Optional
 
 from . import __version__
@@ -93,6 +94,17 @@ def _print_version_hints(client: BatchClient) -> tuple:
     if any(hint.affected for hint in hints):
         warn("A public version hint falls in the wp2shell affected range; verify internally or confirm with authorization.")
     return hints
+
+
+def _load_targets(path: str) -> list[str]:
+    targets = [
+        line.strip()
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not targets:
+        raise ValueError(f"target list contains no targets: {path}")
+    return targets
 
 
 # -- commands ---------------------------------------------------------------
@@ -283,7 +295,15 @@ def cmd_shell(args: argparse.Namespace) -> int:
 
 
 def _add_common(parser: argparse.ArgumentParser, *, rest_route: bool = True) -> None:
-    parser.add_argument("url", help="target base URL, e.g. http://target")
+    targets = parser.add_mutually_exclusive_group(required=True)
+    targets.add_argument("url", nargs="?", help="target base URL, e.g. http://target")
+    targets.add_argument(
+        "-l",
+        "--list",
+        dest="target_file",
+        metavar="FILE",
+        help="read target URLs from FILE, one per non-empty line",
+    )
     if rest_route:
         parser.add_argument(
             "--rest-route",
