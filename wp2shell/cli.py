@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import shlex
 import sys
 from pathlib import Path
@@ -374,10 +375,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _dispatch(args: argparse.Namespace) -> int:
+    if args.target_file is None:
+        return args.func(args)
+
+    result = 0
+    for target in _load_targets(args.target_file):
+        info(f"Target: {target}")
+        target_args = copy.copy(args)
+        target_args.url = target
+        try:
+            target_result = target_args.func(target_args)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate failures between targets
+            bad(f"{target}: {exc}")
+            target_result = 1
+        result = max(result, target_result)
+    return result
+
+
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return args.func(args)
+        return _dispatch(args)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # noqa: BLE001 - surface a clean message, not a traceback

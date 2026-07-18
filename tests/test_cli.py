@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import tempfile
@@ -93,6 +94,81 @@ class TargetSourceTests(unittest.TestCase):
 
             with self.assertRaises(UnicodeDecodeError):
                 cli._load_targets(str(path))
+
+
+class TargetDispatchTests(unittest.TestCase):
+    def test_single_target_calls_handler_without_target_header(self):
+        handler = mock.Mock(return_value=2)
+        args = argparse.Namespace(
+            url="http://one",
+            target_file=None,
+            func=handler,
+        )
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = cli._dispatch(args)
+
+        self.assertEqual(result, 2)
+        handler.assert_called_once_with(args)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_list_mode_runs_all_targets_and_returns_greatest_code(self):
+        handler = mock.Mock(side_effect=[0, 2, 1])
+        args = argparse.Namespace(
+            url=None,
+            target_file="targets.txt",
+            func=handler,
+        )
+
+        with mock.patch.object(
+            cli,
+            "_load_targets",
+            return_value=["http://one", "http://two", "http://three"],
+        ), contextlib.redirect_stdout(io.StringIO()):
+            result = cli._dispatch(args)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            [call.args[0].url for call in handler.call_args_list],
+            ["http://one", "http://two", "http://three"],
+        )
+        self.assertTrue(all(call.args[0] is not args for call in handler.call_args_list))
+
+    def test_list_mode_continues_after_exception_and_names_target(self):
+        handler = mock.Mock(side_effect=[OSError("offline"), 0])
+        args = argparse.Namespace(
+            url=None,
+            target_file="targets.txt",
+            func=handler,
+        )
+        output = io.StringIO()
+
+        with mock.patch.object(
+            cli,
+            "_load_targets",
+            return_value=["http://bad", "http://good"],
+        ), contextlib.redirect_stdout(output):
+            result = cli._dispatch(args)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(handler.call_count, 2)
+        self.assertIn("http://bad: offline", output.getvalue())
+
+    def test_list_mode_does_not_swallow_keyboard_interrupt(self):
+        handler = mock.Mock(side_effect=KeyboardInterrupt)
+        args = argparse.Namespace(
+            url=None,
+            target_file="targets.txt",
+            func=handler,
+        )
+
+        with mock.patch.object(
+            cli,
+            "_load_targets",
+            return_value=["http://one"],
+        ), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            cli._dispatch(args)
 
 
 class ShellCommandTests(unittest.TestCase):
