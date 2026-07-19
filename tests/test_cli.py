@@ -208,6 +208,9 @@ class TargetDispatchTests(unittest.TestCase):
             def run(self, path, command):
                 return "/tmp\n"
 
+            def cleanup(self, path):
+                return True
+
         with tempfile.TemporaryDirectory() as directory:
             target_file = Path(directory) / "targets.txt"
             target_file.write_text("http://one\nhttp://two\n", encoding="utf-8")
@@ -227,7 +230,6 @@ class TargetDispatchTests(unittest.TestCase):
                         "--password",
                         "password",
                         "--interactive",
-                        "--keep",
                     ]
                 )
 
@@ -236,7 +238,7 @@ class TargetDispatchTests(unittest.TestCase):
 
 
 class ShellCommandTests(unittest.TestCase):
-    def test_cleanup_runs_when_command_execution_raises(self):
+    def test_cleanup_runs_by_default_when_command_execution_raises(self):
         class FakeSession:
             instance = None
 
@@ -268,30 +270,11 @@ class ShellCommandTests(unittest.TestCase):
                     "password",
                     "--cmd",
                     "id",
-                    "--cleanup",
                 ]
             )
 
         self.assertEqual(rc, 1)
         self.assertTrue(FakeSession.instance.cleaned)
-
-    def test_keep_and_cleanup_are_mutually_exclusive(self):
-        parser = cli.build_parser()
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(
-                [
-                    "shell",
-                    "http://target",
-                    "--user",
-                    "admin",
-                    "--password",
-                    "password",
-                    "--cmd",
-                    "id",
-                    "--keep",
-                    "--cleanup",
-                ]
-            )
 
     def test_rest_route_is_not_a_shell_option(self):
         parser = cli.build_parser()

